@@ -25,7 +25,7 @@ on:
       - completed
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
@@ -117,17 +117,87 @@ jobs:
             CMD="$CMD --fast"
           fi
           CMD="$CMD --verbose"
-          CMD="$CMD --output \"config/hook_config_$(date +%s).json\""
 
           echo "运行: $CMD"
           eval $CMD
 
-      - name: 上传提取结果
+      - name: 上传提取结果（artifact 备份）
         uses: actions/upload-artifact@v6
         with:
           name: hook-config
           path: config/hook_config_*.json
           retention-days: 90
+
+      - name: 提交配置到仓库
+        id: commit
+        shell: bash
+        run: |
+          set -e
+
+          # 确定版本号
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ steps.get_apk.outputs.inferred_version }}"
+          fi
+
+          # 查找生成的配置文件
+          CONFIG_FILE=$(ls config/hook_config_*.json 2>/dev/null | head -1)
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "::warning::未找到生成的配置文件，跳过提交"
+            exit 0
+          fi
+
+          echo "生成的配置文件: $CONFIG_FILE"
+
+          # 更新 known_configs.json
+          if [ -n "$VERSION" ]; then
+            echo "更新 known_configs.json（版本 $VERSION）..."
+            python3 << PYEOF
+          import json
+
+          config_file = "$CONFIG_FILE"
+          known_file = "config/known_configs.json"
+
+          # 读取提取到的配置
+          with open(config_file, 'r', encoding='utf-8') as f:
+              new_config = json.load(f)
+
+          # 读取已知配置表
+          with open(known_file, 'r', encoding='utf-8') as f:
+              known = json.load(f)
+
+          # 合并新版本配置
+          for ver, cfg in new_config.items():
+              if ver not in known.get("versions", {}):
+                  known["versions"][ver] = cfg
+                  print(f"  已添加 {ver} 到 known_configs.json")
+
+          with open(known_file, 'w', encoding='utf-8') as f:
+              json.dump(known, f, indent=2, ensure_ascii=False)
+
+          print("  known_configs.json 更新完成")
+          PYEOF
+          fi
+
+          # Git 提交
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add config/hook_config_*.json config/known_configs.json
+
+          if git diff --cached --quiet; then
+            echo "没有变更需要提交"
+            exit 0
+          fi
+
+          COMMIT_MSG="chore: add hook config"
+          [ -n "$VERSION" ] && COMMIT_MSG="$COMMIT_MSG for WeChat $VERSION"
+          COMMIT_MSG="$COMMIT_MSG [skip ci]"
+
+          git commit -m "$COMMIT_MSG"
+          git push
+
+          echo "已提交配置到仓库"
 
       - name: 输出配置摘要
         shell: bash
