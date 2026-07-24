@@ -73,9 +73,18 @@ jobs:
               )
               return result.stdout if result.returncode == 0 and result.stdout.strip() else ""
 
+          def extract_section(text, section_id):
+              """提取 id='section_id' 的 DOM 节点内容"""
+              # 匹配 <... id="android" ...> ... </...> 或自闭合之前的内容
+              pattern = re.compile(
+                  r'<[^>]+\bid\s*=\s*["\']' + re.escape(section_id) + r'["\'][^>]*>(.*?)(?=<[^>]+\bid\s*=\s*["\']|$)',
+                  re.I | re.DOTALL
+              )
+              m = pattern.search(text)
+              return m.group(1) if m else text
+
           def parse_version(text):
               """从文本提取微信版本号 X.X.X (主版本 >= 8)"""
-              # 优先匹配 "X.X.X" 格式，且主版本号 >= 8
               for m in re.finditer(r'(\d+)\.(\d+)\.(\d+)', text):
                   if int(m.group(1)) >= 8:
                       return m.group(0)
@@ -107,15 +116,17 @@ jobs:
                   return (arm64[0] if arm64 else apk_urls[0]), "APK 链接列表"
               return "", ""
 
-          def find_version_in_page(text):
-              """从页面提取版本号"""
+          def find_version_in_section(text, section_id="android"):
+              """在指定 DOM 区域内提取版本号"""
+              section = extract_section(text, section_id)
               # 发布版本： 微信 8.0.76
-              m = re.search(r'发布版本[：:]\s*微信\s*(\d+\.\d+\.\d+)', text)
+              m = re.search(r'发布版本[：:]\s*微信\s*(\d+\.\d+\.\d+)', section)
               if m: return m.group(1)
-              # Android 8.0.76
-              m = re.search(r'Android\D*(\d+\.\d+\.\d+)', text)
+              # Android 8.0.76 或更新至 X.X.X
+              m = re.search(r'(?:Android|更新至)\D*(\d+\.\d+\.\d+)', section)
               if m: return m.group(1)
-              return ""
+              # 兜底: 区域内任意 X.X.X (主版本>=8)
+              return parse_version(section)
 
           # ------- 主流程 -------
 
@@ -124,30 +135,33 @@ jobs:
               list_page = f.read()
           list_page = html.unescape(list_page)
 
-          # 2b. 从列表页提取最新版本号
-          version = find_version_in_page(list_page)
-          if not version:
-              version = parse_version(list_page)
-
+          # 2b. 在 id="android" 区域内提取第一个版本号
+          version = find_version_in_section(list_page, "android")
           if version:
-              print(f"从列表页提取到版本: {version}")
+              print(f"从列表页 (id=android) 提取到版本: {version}")
           else:
-              print("::warning::未能从列表页提取版本号")
+              # 兜底：全页搜索
+              version = parse_version(list_page)
+              if version:
+                  print(f"从列表页（全页兜底）提取到版本: {version}")
+              else:
+                  print("::warning::未能从列表页提取版本号")
 
           apk_url = ""
           vshort = version_short(version) if version else ""
 
-          # 2c. 尝试访问版本详情页
+          # 2c. 优先访问 SSR 详情页: /updates/android/{vshort}?head=true
+          #     （该页面不依赖 Vue.js，curl 即可获取完整内容，包含 APK 链接）
           detail_pages = []
-          if version:
-              detail_pages.append((
-                  f"https://weixin.qq.com/updates?platform=android&version={version}",
-                  f"版本详情页(version={version})"
-              ))
           if vshort:
               detail_pages.append((
                   f"https://weixin.qq.com/updates/android/{vshort}?head=true",
-                  f"版本详情页(android/{vshort})"
+                  f"SSR详情页(android/{vshort})"
+              ))
+          if version:
+              detail_pages.append((
+                  f"https://weixin.qq.com/updates?platform=android&version={version}",
+                  f"SPA详情页(version={version})"
               ))
 
           for detail_url, label in detail_pages:
@@ -160,34 +174,33 @@ jobs:
               detail_html = html.unescape(detail_html)
               print(f"    获取成功 ({len(detail_html)} 字节)")
 
-              # 在详情页找 APK
+              # 详情页 APK 链接在 id="android" 之外，必须搜全页
               apk_url, method = find_apk(detail_html)
               if apk_url:
                   print(f"    ✓ 找到 APK ({method}): {apk_url}")
                   # 详情页可能有更精确的版本号
-                  v2 = find_version_in_page(detail_html)
-                  if v2:
+                  v2 = parse_version(detail_html)
+                  if v2 and int(v2.split('.')[0]) >= 8:
                       version = v2
                       print(f"    版本号更新: {version}")
                   break
               else:
                   print(f"    未找到 APK 链接")
 
-          # 2d. 兜底：直接在列表页找
+          # 2d. 兜底：在列表页全页搜索 APK 链接
           if not apk_url:
-              print(f"\n  兜底：在列表页搜索 APK 链接...")
+              print(f"\n  兜底：在列表页全页搜索 APK 链接...")
               apk_url, method = find_apk(list_page)
               if apk_url:
                   print(f"  ✓ 找到 APK ({method}): {apk_url}")
-                  # 从 APK URL 提取版本号
                   if not version:
                       m = re.search(r'(\d+\.\d+\.\d+)', apk_url)
                       if m: version = m.group(1)
               else:
                   print("::warning::所有途径均未找到 APK 链接")
 
-          # 2e. 最终版本号提取
-          if version and apk_url and not find_version_in_page(list_page):
+          # 2e. 最终版本号确认
+          if not version and apk_url:
               m = re.search(r'(\d+\.\d+\.\d+)', apk_url)
               if m: version = m.group(1)
 
