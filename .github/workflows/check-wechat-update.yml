@@ -44,7 +44,7 @@ jobs:
           for url in "${PAGE_URLS[@]}"; do
             echo "尝试抓取: $url"
             if curl -sL --max-time 15 --retry 3 --retry-delay 5 \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -A "Mozilla/5.0 (Linux; Android 16.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36" \
               -o "$PAGE_FILE" \
               "$url" 2>/dev/null; then
               if [ -s "$PAGE_FILE" ]; then
@@ -215,7 +215,7 @@ jobs:
           # 写入记录文件
           echo "$CURRENT_URL" > .last_apk_url
 
-          # 提交到仓库
+          # 提交到仓库（先拉取远程变更，避免 extract 工作流已推送导致的冲突）
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .last_apk_url
@@ -223,6 +223,7 @@ jobs:
           MSG="chore: update last APK link"
           [ -n "$VERSION" ] && MSG="$MSG (WeChat $VERSION)"
           git commit -m "$MSG [skip ci]"
+          git pull --rebase origin master
           git push
 
           echo "已成功更新 .last_apk_url 记录"
