@@ -152,18 +152,18 @@ jobs:
           # 更新 known_configs.json
           if [ -n "$VERSION" ]; then
             echo "更新 known_configs.json（版本 $VERSION）..."
-            python3 << PYEOF
-          import json
-
-          config_file = "$CONFIG_FILE"
+            export CONFIG_FILE
+            python3 -c '
+          import json, os
+          config_file = os.environ["CONFIG_FILE"]
           known_file = "config/known_configs.json"
 
           # 读取提取到的配置
-          with open(config_file, 'r', encoding='utf-8') as f:
+          with open(config_file, "r", encoding="utf-8") as f:
               new_config = json.load(f)
 
           # 读取已知配置表
-          with open(known_file, 'r', encoding='utf-8') as f:
+          with open(known_file, "r", encoding="utf-8") as f:
               known = json.load(f)
 
           # 合并新版本配置
@@ -172,11 +172,11 @@ jobs:
                   known["versions"][ver] = cfg
                   print(f"  已添加 {ver} 到 known_configs.json")
 
-          with open(known_file, 'w', encoding='utf-8') as f:
+          with open(known_file, "w", encoding="utf-8") as f:
               json.dump(known, f, indent=2, ensure_ascii=False)
 
           print("  known_configs.json 更新完成")
-          PYEOF
+          '
           fi
 
           # Git 提交
@@ -195,6 +195,7 @@ jobs:
           COMMIT_MSG="$COMMIT_MSG [skip ci]"
 
           git commit -m "$COMMIT_MSG"
+          git pull --rebase origin master
           git push
 
           echo "已提交配置到仓库"

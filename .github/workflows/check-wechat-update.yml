@@ -32,95 +32,168 @@ jobs:
         run: |
           set -e
 
-          # 备选 URL 列表（按优先级排序）
-          PAGE_URLS=(
-            "https://weixin.qq.com/updates?platform=android"
-          )
-
           mkdir -p /tmp/wxscrape
-          PAGE_FILE="/tmp/wxscrape/page.html"
-          FOUND=false
+          MOBILE_UA="Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
 
-          for url in "${PAGE_URLS[@]}"; do
-            echo "尝试抓取: $url"
-            if curl -sL --max-time 15 --retry 3 --retry-delay 5 \
-              -A "Mozilla/5.0 (Linux; Android 16.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36" \
-              -o "$PAGE_FILE" \
-              "$url" 2>/dev/null; then
-              if [ -s "$PAGE_FILE" ]; then
-                echo "成功获取页面: $url"
-                FOUND=true
-                break
-              fi
-            fi
-            echo "页面 $url 不可达，尝试下一个..."
-          done
+          fetch_page() {
+            local url="$1" out="$2" ua="$3"
+            echo "  抓取: $url"
+            curl -sL --max-time 15 --retry 2 --retry-delay 5 \
+              -A "$ua" -o "$out" "$url" && [ -s "$out" ]
+          }
 
-          if [ "$FOUND" = false ]; then
-            echo "::error::所有备选页面均不可达，跳过本轮检查"
+          # ============================================================
+          # 步骤 1：移动端 UA 访问 Android 更新列表页
+          # ============================================================
+          echo "===== 步骤1：获取 Android 更新列表页 ====="
+          LIST_FILE="/tmp/wxscrape/list.html"
+          if ! fetch_page "https://weixin.qq.com/updates?platform=android" "$LIST_FILE" "$MOBILE_UA"; then
+            echo "::warning::无法获取列表页"
             echo "apk_url=" >> "$GITHUB_OUTPUT"
             echo "version=" >> "$GITHUB_OUTPUT"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "  列表页获取成功 ($(wc -c < "$LIST_FILE") 字节)"
 
-          # 用 Python 解析 HTML 提取 APK 链接和版本号
+          # ============================================================
+          # 步骤 2：Python 解析 → 提取最新版本号 → 访问详情页 → 找 APK
+          # ============================================================
           python3 << 'PYEOF'
-          import os, re, html
+          import os, re, html, subprocess, sys
 
-          with open("/tmp/wxscrape/page.html", "r", encoding="utf-8", errors="replace") as f:
-              page = f.read()
+          MOBILE_UA = "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
 
-          page = html.unescape(page)
+          def fetch(url, ua=MOBILE_UA):
+              """curl 抓取页面"""
+              result = subprocess.run(
+                  ["curl", "-sL", "--max-time", "15", "--retry", "2", "--retry-delay", "5",
+                   "-A", ua, url],
+                  capture_output=True, text=True, timeout=20
+              )
+              return result.stdout if result.returncode == 0 and result.stdout.strip() else ""
 
-          # 策略：优先提取 "下载最新版本" 链接文字对应的 href
-          apk_url = ""
-          m = re.search(r'<a[^>]*href=["\'](https://[^"\'>]+?\.apk)["\'][^>]*>\s*下载最新版本\s*</a>', page, re.I)
-          if m:
-              apk_url = m.group(1)
-              print(f"从「下载最新版本」链接提取到 APK: {apk_url}")
-          else:
-              # 容错：尝试换种顺序 attribute 可能在 text 之后
-              m = re.search(r'<a[^>]*>\s*下载最新版本\s*</a>', page, re.I)
+          def parse_version(text):
+              """从文本提取微信版本号 X.X.X (主版本 >= 8)"""
+              # 优先匹配 "X.X.X" 格式，且主版本号 >= 8
+              for m in re.finditer(r'(\d+)\.(\d+)\.(\d+)', text):
+                  if int(m.group(1)) >= 8:
+                      return m.group(0)
+              return ""
+
+          def version_short(ver):
+              """8.0.76 → 8076"""
+              return ver.replace(".", "")
+
+          def find_apk(text):
+              """在页面中搜索 APK 下载链接"""
+              # 策略1：下载最新版本
+              m = re.search(r'<a[^>]*href=["\'](https?://[^"\'>]+?\.apk)["\'][^>]*>\s*下载最新版本\s*</a>', text, re.I)
               if m:
-                  # 往前找最近的 href
-                  before = page[:m.start()]
-                  href_m = re.findall(r'href=["\'](https://[^"\'>]+?\.apk)["\']', before)
+                  return m.group(1), "下载最新版本"
+
+              # 策略2：下载最新版本 反向查找
+              m = re.search(r'<a[^>]*>\s*下载最新版本\s*</a>', text, re.I)
+              if m:
+                  before = text[:m.start()]
+                  href_m = re.findall(r'href=["\'](https?://[^"\'>]+?\.apk)["\']', before)
                   if href_m:
-                      apk_url = href_m[-1]
-                      print(f"从「下载最新版本」附近提取到 APK: {apk_url}")
+                      return href_m[-1], "下载最新版本(反向)"
 
-          if not apk_url:
-              # 最终容错：提取所有 .apk 链接，优先 arm64
-              apk_urls = re.findall(r'https://[^"\'> ]+\.apk', page)
+              # 策略3：所有 .apk 链接，优先 arm64
+              apk_urls = re.findall(r'https?://[^"\'> ]+\.apk', text)
               if apk_urls:
-                  arm64_urls = [u for u in apk_urls if "arm64" in u]
-                  apk_url = arm64_urls[0] if arm64_urls else apk_urls[0]
-                  print(f"::warning::未找到「下载最新版本」链接，退而使用: {apk_url}")
-              else:
-                  print("::warning::未找到任何 APK 链接")
+                  arm64 = [u for u in apk_urls if "arm64" in u.lower()]
+                  return (arm64[0] if arm64 else apk_urls[0]), "APK 链接列表"
+              return "", ""
 
-          if not apk_url:
-              print("::warning::无法获取 APK 链接，将用空值跳过")
-          else:
-              print(f"APK: {apk_url}")
+          def find_version_in_page(text):
+              """从页面提取版本号"""
+              # 发布版本： 微信 8.0.76
+              m = re.search(r'发布版本[：:]\s*微信\s*(\d+\.\d+\.\d+)', text)
+              if m: return m.group(1)
+              # Android 8.0.76
+              m = re.search(r'Android\D*(\d+\.\d+\.\d+)', text)
+              if m: return m.group(1)
+              return ""
 
-          # 提取版本号
-          version = ""
-          # 优先从 "发布版本： 微信 X.X.X" 提取
-          m = re.search(r'发布版本[：:]\s*微信\s*(\d+\.\d+\.\d+)', page)
-          if m:
-              version = m.group(1)
+          # ------- 主流程 -------
+
+          # 2a. 读取列表页
+          with open("/tmp/wxscrape/list.html", "r", encoding="utf-8", errors="replace") as f:
+              list_page = f.read()
+          list_page = html.unescape(list_page)
+
+          # 2b. 从列表页提取最新版本号
+          version = find_version_in_page(list_page)
           if not version:
-              m = re.search(r'Android\D*(\d+\.\d+\.\d+)', page)
-              if m:
-                  version = m.group(1)
-          if not version and apk_url:
-              m = re.search(r'(\d+\.\d+\.\d+)', apk_url)
-              if m:
-                  version = m.group(1)
+              version = parse_version(list_page)
 
-          print(f"版本号: {version if version else '未知'}")
+          if version:
+              print(f"从列表页提取到版本: {version}")
+          else:
+              print("::warning::未能从列表页提取版本号")
+
+          apk_url = ""
+          vshort = version_short(version) if version else ""
+
+          # 2c. 尝试访问版本详情页
+          detail_pages = []
+          if version:
+              detail_pages.append((
+                  f"https://weixin.qq.com/updates?platform=android&version={version}",
+                  f"版本详情页(version={version})"
+              ))
+          if vshort:
+              detail_pages.append((
+                  f"https://weixin.qq.com/updates/android/{vshort}?head=true",
+                  f"版本详情页(android/{vshort})"
+              ))
+
+          for detail_url, label in detail_pages:
+              print(f"\n  尝试 {label}: {detail_url}")
+              detail_html = fetch(detail_url)
+              if not detail_html:
+                  print(f"    页面为空，跳过")
+                  continue
+
+              detail_html = html.unescape(detail_html)
+              print(f"    获取成功 ({len(detail_html)} 字节)")
+
+              # 在详情页找 APK
+              apk_url, method = find_apk(detail_html)
+              if apk_url:
+                  print(f"    ✓ 找到 APK ({method}): {apk_url}")
+                  # 详情页可能有更精确的版本号
+                  v2 = find_version_in_page(detail_html)
+                  if v2:
+                      version = v2
+                      print(f"    版本号更新: {version}")
+                  break
+              else:
+                  print(f"    未找到 APK 链接")
+
+          # 2d. 兜底：直接在列表页找
+          if not apk_url:
+              print(f"\n  兜底：在列表页搜索 APK 链接...")
+              apk_url, method = find_apk(list_page)
+              if apk_url:
+                  print(f"  ✓ 找到 APK ({method}): {apk_url}")
+                  # 从 APK URL 提取版本号
+                  if not version:
+                      m = re.search(r'(\d+\.\d+\.\d+)', apk_url)
+                      if m: version = m.group(1)
+              else:
+                  print("::warning::所有途径均未找到 APK 链接")
+
+          # 2e. 最终版本号提取
+          if version and apk_url and not find_version_in_page(list_page):
+              m = re.search(r'(\d+\.\d+\.\d+)', apk_url)
+              if m: version = m.group(1)
+
+          print(f"\n===== 结果 =====")
+          print(f"  版本号: {version if version else '未知'}")
+          print(f"  APK:    {apk_url if apk_url else '未找到'}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"apk_url={apk_url}\n")
@@ -142,7 +215,10 @@ jobs:
           CURRENT_URL="${{ steps.scrape.outputs.apk_url }}"
           echo "当前最新链接: $CURRENT_URL"
 
-          if [ "$LAST_URL" = "$CURRENT_URL" ]; then
+          if [ -z "$CURRENT_URL" ]; then
+            echo "未抓取到 APK 链接，跳过"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          elif [ "$LAST_URL" = "$CURRENT_URL" ]; then
             echo "链接与上次提取过的相同，说明无新版本，跳过"
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
