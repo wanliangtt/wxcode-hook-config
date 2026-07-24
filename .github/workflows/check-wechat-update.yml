@@ -50,7 +50,6 @@ jobs:
           if ! fetch_page "https://weixin.qq.com/updates?platform=android" "$LIST_FILE" "$MOBILE_UA"; then
             echo "::warning::无法获取列表页"
             echo "apk_url=" >> "$GITHUB_OUTPUT"
-            echo "version=" >> "$GITHUB_OUTPUT"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -205,12 +204,10 @@ jobs:
               if m: version = m.group(1)
 
           print(f"\n===== 结果 =====")
-          print(f"  版本号: {version if version else '未知'}")
           print(f"  APK:    {apk_url if apk_url else '未找到'}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"apk_url={apk_url}\n")
-              f.write(f"version={version}\n")
           PYEOF
 
       - name: 检查链接是否与上次提取过的一致
@@ -249,21 +246,16 @@ jobs:
           set -e -o pipefail
 
           APK_URL="${{ steps.scrape.outputs.apk_url }}"
-          VERSION="${{ steps.scrape.outputs.version }}"
 
           echo "========================================"
           echo "  触发 Hook 配置提取"
           echo "  APK: $APK_URL"
-          [ -n "$VERSION" ] && echo "  版本: $VERSION"
           echo "========================================"
-
-          ARGS="-f apk_url=$APK_URL"
-          [ -n "$VERSION" ] && ARGS="$ARGS -f version=$VERSION"
 
           # 触发下游工作流，保存原始输出（不依赖 --json / --jq）
           RUN_OUTPUT=$(gh workflow run "提取微信 Hook 配置" \
             --ref master \
-            $ARGS 2>&1)
+            -f apk_url="$APK_URL" 2>&1)
           echo "gh 输出: $RUN_OUTPUT"
 
           # 从输出文本中提取 run ID（兼容中英文输出）
@@ -308,10 +300,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .last_apk_url
-          VERSION="${{ steps.scrape.outputs.version }}"
-          MSG="chore: update last APK link"
-          [ -n "$VERSION" ] && MSG="$MSG (WeChat $VERSION)"
-          git commit -m "$MSG [skip ci]"
+          git commit -m "chore: update last APK link [skip ci]"
           git pull --rebase origin master
           git push
 
