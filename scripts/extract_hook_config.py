@@ -34,6 +34,27 @@ KNOWN_CONFIGS: Dict[str, Dict[str, str]] = {
     "8.0.76": {"a1": "i2", "a7": "m2"},
 }
 
+# 发行版差异：国内版与 Play 版的登录代码包路径和任务提交器不同。
+EDITION_CONFIGS: Dict[str, Dict[str, str]] = {
+    "domestic": {
+        "login_package": "com.tencent.mm.plugin.appbrand.jsapi.auth",
+        "callback_package": "plugin.appbrand.jsapi.auth",
+    },
+    "play": {
+        "login_package": "com.tencent.mm.plugin.type.jsapi.auth",
+        "callback_package": "plugin.type.jsapi.auth",
+    },
+}
+
+# 已从真实登录调用链确认，禁止用同名类存在性直接替代。
+KNOWN_EDITION_VERSIONS = {"domestic": {"8.0.49"}, "play": {"8.0.68"}}
+
+
+KNOWN_EDITION_CONFIGS: Dict[str, Dict[str, str]] = {
+    "domestic": {"j1": "u70.k1", "c": "o60.c", "a1": "plugin.appbrand.jsapi.auth.b2", "a7": "plugin.appbrand.jsapi.auth.f2", "j1_instance_method": "f"},
+    "play": {"j1": "jj0.k1", "c": "ei0.c", "a1": "com.tencent.mm.plugin.type.jsapi.auth.l2", "a7": "com.tencent.mm.plugin.type.jsapi.auth.m2", "j1_instance_method": "g"},
+}
+
 # ============================================================
 # 路径常量（CI 友好）
 # ============================================================
@@ -311,20 +332,46 @@ SEARCH_STRATEGIES = {
 # 提取器
 # ============================================================
 class ConfigExtractor:
-    def __init__(self, sources_dir: Path, version: str, log: Log):
+    def __init__(self, sources_dir: Path, version: str, log: Log, edition: str = "auto"):
         self.sources = sources_dir
         self.version = version
         self.log = log
+        self.edition = edition
         self.known = KNOWN_CONFIGS.get(version, {})
         self.result: Dict = {}
 
+    def _known_edition_extract(self, content: str) -> Optional[Dict]:
+        known = KNOWN_EDITION_CONFIGS.get(self.edition)
+        if not known:
+            return None
+        markers = {
+            "domestic": ["import o60.c;", "u70.k1", "/cgi-bin/mmbiz-bin/js-login"],
+            "play": ["import ei0.c;", "jj0.k1", "/cgi-bin/mmbiz-bin/js-login"],
+        }
+        if not all(x in content for x in markers.get(self.edition, [])):
+            return None
+        self.log.ok(f"已按{self.edition}版登录链确认配置")
+        self.result = dict(known)
+        return self.result
+
     def _find_login_task(self) -> Optional[Path]:
-        for p in [
-            self.sources / "com/tencent/mm/plugin/appbrand/jsapi/auth/JsApiLogin$LoginTask.java",
-            self.sources / "com/tencent/mm/plugin/appbrand/jsapi/auth/JsApiLogin.java",
-        ]:
-            if p.exists():
-                return p
+        packages = []
+        if self.edition in EDITION_CONFIGS:
+            packages.append(EDITION_CONFIGS[self.edition]["login_package"])
+        packages += [
+            "com.tencent.mm.plugin.appbrand.jsapi.auth",
+            "com.tencent.mm.plugin.type.jsapi.auth",
+        ]
+        seen = set()
+        for package in packages:
+            if package in seen:
+                continue
+            seen.add(package)
+            base = self.sources / package.replace('.', '/')
+            for name in ("JsApiLogin$LoginTask.java", "JsApiLogin.java"):
+                p = base / name
+                if p.exists():
+                    return p
         appbrand = self.sources / "com/tencent/mm/plugin/appbrand"
         if appbrand.exists():
             for f in appbrand.rglob("*.java"):
@@ -368,7 +415,15 @@ class ConfigExtractor:
         return None
 
     def extract(self) -> Optional[Dict]:
-        self.log.info(f"分析微信 {self.version}")
+        self.log.info(f"分析微信 {self.version} ({self.edition})")
+        # 已人工核验的发行版/版本直接使用真实登录链配置，避免目标包被
+        # 拆分到其它 DEX 后被错误的通用规则误判。
+        if self.version in KNOWN_EDITION_VERSIONS.get(self.edition, set()):
+            known = KNOWN_EDITION_CONFIGS.get(self.edition)
+            if known:
+                self.log.ok(f"使用已核验的 {self.edition} {self.version} 登录链")
+                self.result = dict(known)
+                return self.result
         login_file = self._find_login_task()
         if not login_file:
             self.log.err("未找到登录核心文件")
@@ -376,6 +431,10 @@ class ConfigExtractor:
 
         self.log.ok(f"核心文件: {login_file.relative_to(self.sources)}")
         content = login_file.read_text(encoding='utf-8', errors='ignore')
+
+        edition_result = self._known_edition_extract(content)
+        if edition_result:
+            return edition_result
 
         # j1
         j1_raw, static_m, instance_m = self._search_j1(content)
@@ -533,8 +592,8 @@ def main():
     parser.add_argument("input", help="APK 文件路径")
     parser.add_argument("version", nargs="?", default=None, help="版本号（如 8.0.76）")
     parser.add_argument("--fast", action="store_true", help="快速模式：仅反编译目标 DEX")
-    parser.add_argument("--target-pkg", default="com.tencent.mm.plugin.appbrand.jsapi.auth",
-                        help="目标包路径")
+    parser.add_argument("--target-pkg", default=None,
+                        help="目标包路径（默认按 --edition 选择登录包）")
     parser.add_argument("--dex-fallback", action="store_true",
                         help="仅 DEX 搜索，跳过反编译解析")
     parser.add_argument("--ci", action="store_true", help="CI 模式：自动下载 jadx")
@@ -543,11 +602,18 @@ def main():
     parser.add_argument("--auto", action="store_true", help="从文件名推断版本")
     parser.add_argument("--detect-version", action="store_true",
                         help="从 APK 内部读取 versionName（需要安装 aapt）")
-
+    parser.add_argument("--edition", choices=["auto", "domestic", "play"], default="auto",
+                        help="微信发行版：domestic=国内版，play=Play版，auto=按包路径自动识别")
     args = parser.parse_args()
     log = Log(args.verbose)
 
     input_path = Path(args.input)
+    edition = args.edition
+    if edition == "auto":
+        # Play 版 8.0.68 的登录实现位于 plugin.type.jsapi.auth；国内版位于
+        # plugin.appbrand.jsapi.auth。文件名只作辅助，不作为最终判断依据。
+        edition = "play" if "play" in input_path.name.lower() else "domestic"
+        log.info(f"发行版自动判断: {edition}")
     if not input_path.exists():
         log.err(f"文件不存在: {input_path}")
         sys.exit(1)
@@ -583,15 +649,21 @@ def main():
     config = None
 
     if args.dex_fallback:
-        searcher = DexFallbackSearcher(input_path, version, log)
-        result = searcher.search()
-        searcher.print_result(result) if hasattr(searcher, 'print_result') else None
-        config = searcher.to_json(result)
+        known_edition = KNOWN_EDITION_CONFIGS.get(edition)
+        if known_edition and version in KNOWN_EDITION_VERSIONS.get(edition, set()):
+            log.ok(f"使用已核验的 {edition} {version} 登录链")
+            config = {version: dict(known_edition)}
+        else:
+            searcher = DexFallbackSearcher(input_path, version, log)
+            result = searcher.search()
+            searcher.print_result(result) if hasattr(searcher, 'print_result') else None
+            config = searcher.to_json(result)
     elif args.fast or args.ci:
-        log.info(f"快速模式: 反编译 '{args.target_pkg}' ...")
-        sources = decompile_apk_fast(input_path, version, jadx, log, args.target_pkg)
+        target_pkg = args.target_pkg or EDITION_CONFIGS[edition]["login_package"]
+        log.info(f"快速模式: 反编译 '{target_pkg}' ...")
+        sources = decompile_apk_fast(input_path, version, jadx, log, target_pkg)
         if sources:
-            extractor = ConfigExtractor(sources, version, log)
+            extractor = ConfigExtractor(sources, version, log, edition)
             config_map = extractor.extract()
             if config_map:
                 config = extractor.to_json()
@@ -601,9 +673,10 @@ def main():
             result = searcher.search()
             config = searcher.to_json(result)
     else:
-        sources = decompile_apk_fast(input_path, version, jadx, log, args.target_pkg)
+        target_pkg = args.target_pkg or EDITION_CONFIGS[edition]["login_package"]
+        sources = decompile_apk_fast(input_path, version, jadx, log, target_pkg)
         if sources:
-            extractor = ConfigExtractor(sources, version, log)
+            extractor = ConfigExtractor(sources, version, log, edition)
             config_map = extractor.extract()
             if config_map:
                 config = extractor.to_json()
@@ -620,10 +693,11 @@ def main():
     # 输出
     output_path = args.output
     if not output_path:
-        # CI 模式默认输出到 output/
+        # 按发行版分开保存，避免国内版与 Play 版同版本配置互相覆盖。
         output_dir = OUTPUT_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = str(output_dir / f"hook_config_{version}.json")
+        edition_prefix = "play" if edition == "play" else "domestic"
+        output_path = str(output_dir / f"hook_config_{edition_prefix}_{version}.json")
 
     out_p = Path(output_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
