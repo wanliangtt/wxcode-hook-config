@@ -1,15 +1,15 @@
 name: 提取微信 Hook 配置
 
 on:
-  # 手动触发
+  # 手触发
   workflow_dispatch:
     inputs:
       version:
-        description: '微信版本号（留空则从文件名自动识别）'
+        description: ''
         required: false
         type: string
       apk_url:
-        description: 'APK/APKS 下载直链'
+        description: 'https://1813902432.share.123pan.cn/123pan/tz6lVv-C3Vp'
         required: true
         type: string
       edition:
