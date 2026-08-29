@@ -9,7 +9,7 @@ on:
         required: false
         type: string
       apk_url:
-        description: 'APK/APKS 下载直链'
+        description: 'https://1813902432.share.123pan.cn/123pan/tz6lVv-C3Vp'
         required: true
         type: string
       edition:
